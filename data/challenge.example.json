@@ -1,0 +1,11 @@
+{
+  "participants": [
+    { "name": "Teilnehmer 1", "team": 1, "startWeight": null },
+    { "name": "Teilnehmer 2", "team": 2, "startWeight": null }
+  ],
+  "smokingBonus": {
+    "participant": "Teilnehmer 2",
+    "team": 2,
+    "label": "Rauchfrei Bonus"
+  }
+}

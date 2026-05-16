@@ -487,7 +487,7 @@ app.put('/api/admin/settings', (req, res) => {
 app.post('/api/admin/weekly-evaluation', (req, res) => {
   const weeklyDay = (db.prepare("SELECT value FROM settings WHERE key='weekly_check_day'").get() || {}).value || 'Sunday';
 
-  // Calculate week start
+  // Calculate week start based on eingestelltem Stichtag
   const now = new Date();
   const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   const targetDay = dayNames.indexOf(weeklyDay);
@@ -502,6 +502,7 @@ app.post('/api/admin/weekly-evaluation', (req, res) => {
   let results = [];
 
   for (const p of participants) {
+    // ─── Zigaretten-Check (bestehende Logik) ────────────────
     const count = db.prepare(
       "SELECT COUNT(*) as cnt FROM activities WHERE participant_id=? AND type='cigarette' AND pace >= ?"
     ).get(p.id, weekStartStr);
@@ -526,6 +527,44 @@ app.post('/api/admin/weekly-evaluation', (req, res) => {
     } else {
       results.push(`✅ ${p.name}: rauchfrei`);
     }
+
+    // ─── Inaktivitäts-Check (keine Aktivität diese Woche → -1) ─
+    const actCount = db.prepare(
+      "SELECT COUNT(*) as cnt FROM activities WHERE participant_id=? AND type NOT IN ('cigarette','inactivity') AND logged_at >= ?"
+    ).get(p.id, weekStartStr);
+    if (actCount.cnt === 0) {
+      db.prepare("INSERT INTO activities (participant_id,type,value,points,pace,logged_at) VALUES (?,?,?,?,?,?)")
+        .run(p.id, 'inactivity', 1, -1, 'Inaktivitaet', weekStartStr + ' 23:59:59');
+      results.push(`⚠️ ${p.name}: keine Aktivitaet → -1 Pkt`);
+    } else {
+      results.push(`✅ ${p.name}: aktiv`);
+    }
+  }
+
+  // ─── Wochensieger-Bonus (+3 für das Team mit den meisten Punkten) ─
+  const teamScores = db.prepare(`
+    SELECT COALESCE(p.team, a.team) as team, COALESCE(SUM(a.points), 0) as total
+    FROM activities a
+    LEFT JOIN participants p ON p.id = a.participant_id
+    WHERE a.logged_at >= ? AND a.type NOT IN ('cigarette','inactivity')
+    GROUP BY COALESCE(p.team, a.team)
+  `).all(weekStartStr);
+
+  let maxScore = 0;
+  let winningTeam = null;
+  for (const ts of teamScores) {
+    if (ts.total > maxScore) {
+      maxScore = ts.total;
+      winningTeam = ts.team;
+    }
+  }
+
+  if (winningTeam !== null && maxScore > 0) {
+    db.prepare("INSERT INTO activities (participant_id,team,type,value,points,pace,logged_at) VALUES (?,?,?,?,?,?,?)")
+      .run(null, winningTeam, 'team_sport', 1, 3, 'Wochensieger', weekStartStr + ' 23:59:59');
+    results.push(`🏆 Team ${winningTeam}: Wochensieger +3 Pkt`);
+  } else {
+    results.push(`➖ Kein Wochensieger (beide Teams 0 Punkte)`);
   }
 
   res.json({ success: true, message: results.join('\n') });

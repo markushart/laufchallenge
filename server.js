@@ -356,22 +356,44 @@ app.post('/api/weight', (req, res) => {
   if (!name || !weight || weight <= 20 || weight > 500) return res.status(400).json({ error: 'name und gültiges weight erforderlich' });
   const p = db.prepare('SELECT * FROM participants WHERE LOWER(name)=?').get(name.toLowerCase());
   if (!p) return res.status(404).json({ error: 'Teilnehmer nicht gefunden' });
+
   const loggedAt = loggedAtForDate(date);
   if (loggedAt) db.prepare('INSERT INTO weight_log (participant_id,weight,logged_at) VALUES (?,?,?)').run(p.id, weight, loggedAt);
   else db.prepare('INSERT INTO weight_log (participant_id,weight) VALUES (?,?)').run(p.id, weight);
-  const sw = p.start_weight || p.current_weight || weight;
-  const { loss, points: pts } = calcWeightPoints(sw, weight);
+
+  // Baseline ist das Startgewicht aus der Config (z.B. Oli: 109.5kg)
+  // Punkte werden kumulativ gegen das Startgewicht gerechnet
+  const baseline = p.start_weight;
+  if (!baseline) return res.status(400).json({ error: 'Kein Startgewicht gesetzt – bitte im Admin-Panel hinterlegen' });
+
+  const totalLoss = baseline - weight;
+  const { points: totalPts } = calcWeightPoints(baseline, weight);
+
+  // Bereits vergebene Gewichts-Punkte abziehen → nur neue echte Punkte
+  const awarded = db.prepare(
+    "SELECT COALESCE(SUM(points), 0) as total FROM activities WHERE participant_id=? AND type='weight_loss'"
+  ).get(p.id).total;
+
+  const pts = Math.max(0, totalPts - awarded);
+  // loss für display: was ist seit dem letzten Eintrag passiert?
+  const lastWeight = db.prepare(
+    'SELECT weight FROM weight_log WHERE participant_id=? AND id != (SELECT MAX(id) FROM weight_log WHERE participant_id=?) ORDER BY id DESC LIMIT 1'
+  ).get(p.id, p.id);
+  const stepLoss = lastWeight ? (lastWeight.weight - weight) : null;
+
   if (pts > 0) {
     if (loggedAt) {
       db.prepare('INSERT INTO activities (participant_id,type,value,points,logged_at) VALUES (?,?,?,?,?)')
-        .run(p.id, 'weight_loss', loss, pts, loggedAt);
+        .run(p.id, 'weight_loss', totalLoss, pts, loggedAt);
     } else {
       db.prepare('INSERT INTO activities (participant_id,type,value,points) VALUES (?,?,?,?)')
-        .run(p.id, 'weight_loss', loss, pts);
+        .run(p.id, 'weight_loss', totalLoss, pts);
     }
   }
   db.prepare('UPDATE participants SET current_weight=? WHERE id=?').run(weight, p.id);
-  res.json({ success: true, points: pts, message: `Gewicht: ${weight}kg (${loss > 0 ? '-' : '+'}${Math.abs(loss)}kg → ${pts} Pkt)` });
+
+  let trend = totalLoss > 0 ? `⬇️ ${Math.abs(totalLoss)}kg` : totalLoss < 0 ? `⬆️ ${Math.abs(totalLoss)}kg` : '➡️ gleich';
+  res.json({ success: true, points: pts, message: `Gewicht: ${weight}kg (${trend} → ${pts} neue Pkt, ${awarded + pts} gesamt)` });
 });
 
 app.get('/api/activities', (req, res) => {
@@ -638,15 +660,27 @@ function startBot(token) {
     const p = getPart(msg); if (!p) return;
     const w = parseFloat(m[1].replace(',','.'));
     db.prepare('INSERT INTO weight_log (participant_id,weight) VALUES (?,?)').run(p.id, w);
-    const sw = p.current_weight || p.start_weight || w;
-    const { loss, points: pts } = calcWeightPoints(sw, w);
+
+    // Kumulativ gegen Startgewicht
+    const baseline = p.start_weight;
+    if (!baseline) {
+      bot.sendMessage(msg.chat.id, '❌ Kein Startgewicht gesetzt – bitte im Admin-Panel hinterlegen.');
+      return;
+    }
+    const totalLoss = baseline - w;
+    const { points: totalPts } = calcWeightPoints(baseline, w);
+    const awarded = db.prepare(
+      "SELECT COALESCE(SUM(points), 0) as total FROM activities WHERE participant_id=? AND type='weight_loss'"
+    ).get(p.id).total;
+    const pts = Math.max(0, totalPts - awarded);
+
     if (pts > 0) {
       db.prepare('INSERT INTO activities (participant_id,type,value,points) VALUES (?,?,?,?)')
-        .run(p.id, 'weight_loss', loss, pts);
+        .run(p.id, 'weight_loss', totalLoss, pts);
     }
     db.prepare('UPDATE participants SET current_weight=? WHERE id=?').run(w, p.id);
-    const trend = loss > 0 ? `⬇️ ${Math.abs(loss)}kg` : loss < 0 ? `⬆️ ${Math.abs(loss)}kg` : '➡️ gleich';
-    bot.sendMessage(msg.chat.id, `✅ ${p.name}: ${w}kg (${trend}) → ${pts} Pkt ⚖️`);
+    const trend = totalLoss > 0 ? `⬇️ ${Math.abs(totalLoss)}kg` : totalLoss < 0 ? `⬆️ ${Math.abs(totalLoss)}kg` : '➡️ gleich';
+    bot.sendMessage(msg.chat.id, `✅ ${p.name}: ${w}kg (${trend} → ${pts} neue Pkt, ${awarded + pts} gesamt) ⚖️`);
   });
 
   bot.onText(/\/standings/, (msg) => {
